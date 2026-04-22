@@ -193,13 +193,14 @@ def clean_text(s):
     s = html.unescape(s)
     return re.sub(r"\s+", " ", s).strip()
 
-def match(title, content, keywords, excludes):
+def match_hits(title, content, keywords, excludes):
+    """返回命中的关键词列表; 命中排除词或没有关键词命中时返回空"""
     hay = (title + "\n" + content).lower()
     if excludes and any(ex.lower() in hay for ex in excludes):
-        return False
+        return []
     if not keywords:
-        return False
-    return any(kw.lower() in hay for kw in keywords)
+        return []
+    return [kw for kw in keywords if kw.lower() in hay]
 
 def entry_board(entry):
     tags = entry.get("tags", []) or []
@@ -247,19 +248,19 @@ def poll_once():
         title   = clean_text(entry.get("title", ""))
         content = clean_text(entry.get("summary", "") or entry.get("description", ""))
 
-        if not match(title, content, cfg["keywords"], cfg["excludes"]):
+        hits = match_hits(title, content, cfg["keywords"], cfg["excludes"])
+        if not hits:
             continue
 
         link     = entry.get("link", "")
-        author   = entry.get("author", "unknown")
         board    = entry_board(entry)
         board_zh = BOARDS.get(board, board)
-        snippet  = content[:200] + ("..." if len(content) > 200 else "")
+        hit_str  = ", ".join(html.escape(h) for h in hits)
 
         msg = (
             f"🔔 <b>NodeSeek · {html.escape(board_zh)}</b>\n\n"
-            f"<b>{html.escape(title)}</b>\n\n"
-            f"{html.escape(snippet)}\n\n"
+            f"🔑 <b>关键词:</b> {hit_str}\n\n"
+            f"{html.escape(title)}\n\n"
             f"🔗 <a href=\"{html.escape(link)}\">查看原帖</a>"
         )
         tg_send(cfg["chat_id"], msg, disable_preview=False)
