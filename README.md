@@ -21,17 +21,18 @@
 ## 快速部署
 
 ```bash
-# 1. 克隆仓库
-git clone https://github.com/merlin-node/ns_monitor.git nodeseek-monitor
-cd nodeseek-monitor
+# 1. 建目录
+mkdir -p nodeseek-monitor && cd nodeseek-monitor
+mkdir -p data
 
-# 2. 创建 .env 文件
-cat > .env <<EOF
-TG_BOT_TOKEN=你的bot_token
-ALLOWED_USER_IDS=你的user_id
-EOF
+# 2. 拉配置文件
+wget https://raw.githubusercontent.com/merlin-node/ns_monitor/main/docker-compose.yml
+wget https://raw.githubusercontent.com/merlin-node/ns_monitor/main/.env.example -O .env
 
-# 3. 启动
+# 3. 编辑 .env, 填入你的 TG_BOT_TOKEN 和 ALLOWED_USER_IDS
+nano .env
+
+# 4. 启动
 docker compose up -d
 docker compose logs -f
 ```
