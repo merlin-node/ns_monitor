@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """NodeSeek 关键词监控 -> Telegram Bot (NsAlert)
-纯面板版:
-  - 输入框左下角持久化菜单按钮 -> 弹出控制面板
-  - 所有操作通过内联按钮完成
-  - 文字命令已废弃 (仅保留 /menu /start /cancel)
+单气泡无痕版:
+  - 聊天里只有一个面板气泡 + 新帖推送
+  - 文字输入流程在面板内原地完成, 无脏消息
+  - 反馈行嵌在面板顶部, 下次操作自动消失
 """
 import os
 import re
@@ -65,10 +65,19 @@ logging.basicConfig(
 )
 log = logging.getLogger("nsmon")
 
-# ========== 配置管理 ==========
+# ========== 状态 ==========
 _lock = threading.Lock()
-_pending = {}  # user_id -> {"action": ..., "chat_id": ..., "menu_msg_id": ...}
 
+# user_id -> {"action": "add_key"/"add_ex"/"set_interval"}
+_pending = {}
+
+# chat_id -> message_id  (当前活跃面板气泡)
+_panel_msg = {}
+
+# chat_id -> str  (面板顶部的临时反馈行, 下次刷新后清空)
+_panel_flash = {}
+
+# ========== 配置 ==========
 def _default_cfg():
     return {
         "chat_id":  INIT_CHAT_ID,
@@ -120,7 +129,7 @@ def tg_call(method, **params):
         r = requests.post(f"{TG_API}/{method}", json=params, timeout=70, proxies=PROXIES)
         data = r.json()
         if not data.get("ok"):
-            log.warning("TG %s failed: %s", method, data)
+            log.debug("TG %s not ok: %s", method, data)
         return data
     except Exception as e:
         log.warning("TG %s error: %s", method, e)
@@ -149,23 +158,32 @@ def tg_edit(chat_id, message_id, text, reply_markup=None):
         params["reply_markup"] = reply_markup
     return tg_call("editMessageText", **params)
 
-def tg_answer_cb(cb_id, text=None):
+def tg_delete(chat_id, message_id):
+    """删消息, 失败静默忽略"""
+    if not message_id:
+        return
+    try:
+        tg_call("deleteMessage", chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+def tg_answer_cb(cb_id, text=None, alert=False):
     params = {"callback_query_id": cb_id}
     if text:
         params["text"] = text
+    if alert:
+        params["show_alert"] = True
     return tg_call("answerCallbackQuery", **params)
 
 def setup_tg_ui():
-    """注册菜单按钮 + 命令列表 (启动时调用一次)"""
-    # 菜单按钮 (输入框左边): 点击后展示 commands 列表
+    """启动时注册 TG 菜单按钮 + 命令列表"""
     tg_call("setChatMenuButton", menu_button={"type": "commands"})
-    # 只注册一个 /menu, 避免命令列表里出现一堆已废弃的命令
     tg_call("setMyCommands", commands=[
         {"command": "menu", "description": "🎯 打开 NsAlert 控制面板"},
     ])
     log.info("TG UI registered")
 
-# ========== 匹配逻辑 ==========
+# ========== 匹配 ==========
 TAG_RE = re.compile(r"<[^>]+>")
 
 def clean_text(s):
@@ -269,6 +287,14 @@ def fmt_boards(subscribed):
 def is_allowed(user_id):
     return (not ALLOWED_IDS) or (user_id in ALLOWED_IDS)
 
+def pop_flash(chat_id):
+    """取出并清空反馈行"""
+    return _panel_flash.pop(chat_id, None)
+
+def set_flash(chat_id, text):
+    """设置反馈行 (下次刷新后消失)"""
+    _panel_flash[chat_id] = text
+
 # ========== 面板视图 ==========
 def kb(rows):
     return {"inline_keyboard": rows}
@@ -276,13 +302,20 @@ def kb(rows):
 def btn(text, data):
     return {"text": text, "callback_data": data}
 
-def view_main():
+def _flash_prefix(chat_id):
+    flash = pop_flash(chat_id)
+    if flash:
+        return f"{flash}\n━━━━━━━━━━━━━━━━\n\n"
+    return ""
+
+def view_main(chat_id):
     with _lock:
         cfg = dict(config)
     status_emoji = "🟢" if cfg["enabled"] else "🔴"
     status_text  = "开启" if cfg["enabled"] else "关闭"
     board_text   = fmt_boards(cfg.get("boards") or [])
     text = (
+        f"{_flash_prefix(chat_id)}"
         "🎯 <b>NsAlert 控制面板</b>\n\n"
         f"状态: {status_emoji} {status_text}　 间隔: {cfg['interval']}秒\n"
         f"关键词: {len(cfg['keywords'])} 个　 排除词: {len(cfg['excludes'])} 个\n"
@@ -298,28 +331,40 @@ def view_main():
     ])
     return text, markup
 
-def view_keys():
+def view_keys(chat_id, waiting=False):
     with _lock:
         cfg = dict(config)
     ks = cfg["keywords"]
-    text = "📋 <b>关键词管理</b>\n\n"
+    body = "📋 <b>关键词管理</b>\n\n"
     if ks:
-        text += f"当前 ({len(ks)} 个):\n"
-        text += "\n".join(f"• <code>{html.escape(k)}</code>" for k in ks)
+        body += f"当前 ({len(ks)} 个):\n"
+        body += "\n".join(f"• <code>{html.escape(k)}</code>" for k in ks)
     else:
-        text += "(空) 请先添加关键词, 否则不会有推送"
-    markup = kb([
-        [btn("➕ 添加", "add_key"), btn("➖ 删除", "del_key_list")],
-        [btn("🗑️ 清空全部", "clear_keys_confirm")],
-        [btn("⬅️ 返回主菜单", "main")],
-    ])
+        body += "(空) 请先添加关键词, 否则不会有推送"
+
+    if waiting:
+        body += (
+            "\n\n━━━━━━━━━━━━━━━━\n"
+            "✏️ <b>请发送要添加的关键词</b>\n"
+            "标题或内容包含它即会被推送\n"
+            "━━━━━━━━━━━━━━━━"
+        )
+        markup = kb([[btn("❌ 取消", "cancel_input")]])
+    else:
+        markup = kb([
+            [btn("➕ 添加", "add_key"), btn("➖ 删除", "del_key_list")],
+            [btn("🗑️ 清空全部", "clear_keys_confirm")],
+            [btn("⬅️ 返回主菜单", "main")],
+        ])
+
+    text = f"{_flash_prefix(chat_id)}{body}"
     return text, markup
 
-def view_del_key_list():
+def view_del_key_list(chat_id):
     with _lock:
         cfg = dict(config)
     ks = cfg["keywords"]
-    text = "➖ <b>删除关键词</b>\n\n点击要删除的关键词:"
+    body = "➖ <b>删除关键词</b>\n\n点击要删除的关键词:"
     rows = []
     for i in range(0, len(ks), 2):
         row = [btn(f"❌ {ks[i]}", f"del_key|{ks[i]}")]
@@ -327,33 +372,46 @@ def view_del_key_list():
             row.append(btn(f"❌ {ks[i+1]}", f"del_key|{ks[i+1]}"))
         rows.append(row)
     if not ks:
-        text += "\n\n(空)"
+        body += "\n\n(空)"
     rows.append([btn("⬅️ 返回", "menu_keys")])
+    text = f"{_flash_prefix(chat_id)}{body}"
     return text, kb(rows)
 
-def view_ex():
+def view_ex(chat_id, waiting=False):
     with _lock:
         cfg = dict(config)
     exs = cfg["excludes"]
-    text = "🚫 <b>排除词管理</b>\n\n"
-    text += "命中任一排除词的帖子会被丢弃, 优先级高于关键词\n\n"
+    body = "🚫 <b>排除词管理</b>\n\n"
+    body += "命中任一排除词的帖子会被丢弃, 优先级高于关键词\n\n"
     if exs:
-        text += f"当前 ({len(exs)} 个):\n"
-        text += "\n".join(f"• <code>{html.escape(k)}</code>" for k in exs)
+        body += f"当前 ({len(exs)} 个):\n"
+        body += "\n".join(f"• <code>{html.escape(k)}</code>" for k in exs)
     else:
-        text += "(空)"
-    markup = kb([
-        [btn("➕ 添加", "add_ex"), btn("➖ 删除", "del_ex_list")],
-        [btn("🗑️ 清空全部", "clear_ex_confirm")],
-        [btn("⬅️ 返回主菜单", "main")],
-    ])
+        body += "(空)"
+
+    if waiting:
+        body += (
+            "\n\n━━━━━━━━━━━━━━━━\n"
+            "✏️ <b>请发送要添加的排除词</b>\n"
+            "命中它的帖子会被丢弃\n"
+            "━━━━━━━━━━━━━━━━"
+        )
+        markup = kb([[btn("❌ 取消", "cancel_input")]])
+    else:
+        markup = kb([
+            [btn("➕ 添加", "add_ex"), btn("➖ 删除", "del_ex_list")],
+            [btn("🗑️ 清空全部", "clear_ex_confirm")],
+            [btn("⬅️ 返回主菜单", "main")],
+        ])
+
+    text = f"{_flash_prefix(chat_id)}{body}"
     return text, markup
 
-def view_del_ex_list():
+def view_del_ex_list(chat_id):
     with _lock:
         cfg = dict(config)
     exs = cfg["excludes"]
-    text = "➖ <b>删除排除词</b>\n\n点击要删除的排除词:"
+    body = "➖ <b>删除排除词</b>\n\n点击要删除的排除词:"
     rows = []
     for i in range(0, len(exs), 2):
         row = [btn(f"❌ {exs[i]}", f"del_ex|{exs[i]}")]
@@ -361,20 +419,21 @@ def view_del_ex_list():
             row.append(btn(f"❌ {exs[i+1]}", f"del_ex|{exs[i+1]}"))
         rows.append(row)
     if not exs:
-        text += "\n\n(空)"
+        body += "\n\n(空)"
     rows.append([btn("⬅️ 返回", "menu_ex")])
+    text = f"{_flash_prefix(chat_id)}{body}"
     return text, kb(rows)
 
-def view_boards():
+def view_boards(chat_id):
     with _lock:
         cfg = dict(config)
     subs = cfg.get("boards") or []
-    text = "📑 <b>板块订阅</b>\n\n"
+    body = "📑 <b>板块订阅</b>\n\n"
     if not subs:
-        text += "当前模式: <b>🌐 全站抓取</b>\n所有板块的新帖都会被扫描"
+        body += "当前模式: <b>🌐 全站抓取</b>\n所有板块的新帖都会被扫描"
     else:
-        text += f"已订阅 {len(subs)} 个板块: {fmt_boards(subs)}\n只扫描这些板块的新帖"
-    text += "\n\n点击切换订阅 (✅=已订阅):"
+        body += f"已订阅 {len(subs)} 个板块: {fmt_boards(subs)}\n只扫描这些板块的新帖"
+    body += "\n\n点击切换订阅 (✅=已订阅):"
 
     rows = []
     codes = list(BOARDS.keys())
@@ -389,27 +448,41 @@ def view_boards():
         rows.append(row)
     rows.append([btn("🌐 切换全站模式", "all_boards")])
     rows.append([btn("⬅️ 返回主菜单", "main")])
+
+    text = f"{_flash_prefix(chat_id)}{body}"
     return text, kb(rows)
 
-def view_interval():
+def view_interval(chat_id, waiting=False):
     with _lock:
         cfg = dict(config)
     cur = cfg["interval"]
-    text = (
+    body = (
         "⚙️ <b>轮询间隔设置</b>\n\n"
         f"当前: <b>{cur} 秒</b>\n\n"
         "常用预设 (秒):"
     )
-    row1 = [btn(f"{'✅ ' if cur==n else ''}{n}", f"set_interval|{n}") for n in INTERVAL_PRESETS]
-    markup = kb([
-        row1,
-        [btn("✏️ 自定义", "custom_interval")],
-        [btn("⬅️ 返回主菜单", "main")],
-    ])
+
+    if waiting:
+        body += (
+            "\n\n━━━━━━━━━━━━━━━━\n"
+            "✏️ <b>请发送自定义秒数</b> (最小 10)\n"
+            "例如: <code>60</code>\n"
+            "━━━━━━━━━━━━━━━━"
+        )
+        markup = kb([[btn("❌ 取消", "cancel_input")]])
+    else:
+        row1 = [btn(f"{'✅ ' if cur==n else ''}{n}", f"set_interval|{n}") for n in INTERVAL_PRESETS]
+        markup = kb([
+            row1,
+            [btn("✏️ 自定义", "custom_interval")],
+            [btn("⬅️ 返回主菜单", "main")],
+        ])
+
+    text = f"{_flash_prefix(chat_id)}{body}"
     return text, markup
 
-def view_guide():
-    text = (
+def view_guide(chat_id):
+    body = (
         "📖 <b>NsAlert 使用说明</b>\n\n"
         "<b>━━━ 这是什么 ━━━</b>\n"
         "自动监控 NodeSeek 新帖, 命中关键词就推送到你的 TG, 适合抢鸡、找货、盯交易。\n\n"
@@ -426,19 +499,61 @@ def view_guide():
         "• 不区分大小写\n"
         "• 多个关键词是<b>或</b>关系 (命中任一即推送)\n"
         "• 排除词优先级高于关键词\n"
-        "• 间隔 10-300 秒, 我选10秒"
+        "• 间隔 10-300 秒, 建议 60 秒"
     )
-    markup = kb([[btn("⬅️ 返回主菜单", "main")]])
-    return text, markup
+    text = f"{_flash_prefix(chat_id)}{body}"
+    return text, kb([[btn("⬅️ 返回主菜单", "main")]])
 
-def view_confirm(action, title):
-    text = f"⚠️ <b>{title}</b>\n\n此操作不可恢复, 确定继续吗?"
-    markup = kb([
+def view_confirm(chat_id, action, title):
+    body = f"⚠️ <b>{title}</b>\n\n此操作不可恢复, 确定继续吗?"
+    text = f"{_flash_prefix(chat_id)}{body}"
+    return text, kb([
         [btn("✅ 确定", f"confirm|{action}"), btn("❌ 取消", "main")],
     ])
-    return text, markup
 
-# ========== 回调处理 ==========
+# ========== 面板状态路由 ==========
+def render_current_view(chat_id, user_id):
+    """根据用户当前 pending 状态决定显示哪个视图"""
+    p = _pending.get(user_id)
+    if p:
+        action = p["action"]
+        if action == "add_key":
+            return view_keys(chat_id, waiting=True)
+        if action == "add_ex":
+            return view_ex(chat_id, waiting=True)
+        if action == "set_interval":
+            return view_interval(chat_id, waiting=True)
+    # 默认回到主菜单
+    return view_main(chat_id)
+
+def send_new_panel(chat_id, user_id):
+    """发新面板到底部, 并记录 msg_id (删除旧面板由调用者负责)"""
+    text, markup = render_current_view(chat_id, user_id)
+    resp = tg_send(chat_id, text, reply_markup=markup)
+    if resp and resp.get("ok"):
+        new_id = resp["result"]["message_id"]
+        _panel_msg[chat_id] = new_id
+        return new_id
+    return None
+
+def refresh_panel(chat_id, user_id, view_fn=None, *view_args):
+    """就地刷新面板 (editMessageText). view_fn 可选, 不传就用当前 pending 状态"""
+    msg_id = _panel_msg.get(chat_id)
+    if not msg_id:
+        # 没有面板, 新发一个
+        send_new_panel(chat_id, user_id)
+        return
+    if view_fn:
+        text, markup = view_fn(chat_id, *view_args)
+    else:
+        text, markup = render_current_view(chat_id, user_id)
+    resp = tg_edit(chat_id, msg_id, text, markup)
+    if resp and not resp.get("ok"):
+        # 编辑失败 (可能面板被删了), 重发
+        _panel_msg.pop(chat_id, None)
+        send_new_panel(chat_id, user_id)
+
+# ========== callback 处理 ==========
 def handle_callback(cb):
     cb_id   = cb["id"]
     data    = cb.get("data", "")
@@ -451,30 +566,72 @@ def handle_callback(cb):
         tg_answer_cb(cb_id, "⛔ 无权限")
         return
 
+    # 如果点的是过期面板的按钮 (不是当前 _panel_msg), 提示后重发面板
+    if _panel_msg.get(chat_id) and msg_id != _panel_msg.get(chat_id):
+        tg_answer_cb(cb_id, "面板已过期, 请发 /menu 重新打开")
+        return
+    # 如果没有记录的面板 id, 把当前这个消息当成面板 (兼容 VPS 重启后的老面板)
+    if chat_id not in _panel_msg:
+        _panel_msg[chat_id] = msg_id
+
     parts = data.split("|", 1)
     action = parts[0]
     arg = parts[1] if len(parts) > 1 else ""
 
-    new_view = None
     toast = None
+    next_view = None  # (view_fn, *args)
 
+    # ---- 导航 ----
     if action == "main":
-        new_view = view_main()
+        # 清除 pending (如果有)
+        _pending.pop(user_id, None)
+        next_view = (view_main,)
     elif action == "menu_keys":
-        new_view = view_keys()
+        _pending.pop(user_id, None)
+        next_view = (view_keys, False)
     elif action == "menu_ex":
-        new_view = view_ex()
+        _pending.pop(user_id, None)
+        next_view = (view_ex, False)
     elif action == "menu_boards":
-        new_view = view_boards()
+        next_view = (view_boards,)
     elif action == "menu_interval":
-        new_view = view_interval()
+        _pending.pop(user_id, None)
+        next_view = (view_interval, False)
     elif action == "menu_guide":
-        new_view = view_guide()
+        next_view = (view_guide,)
     elif action == "del_key_list":
-        new_view = view_del_key_list()
+        next_view = (view_del_key_list,)
     elif action == "del_ex_list":
-        new_view = view_del_ex_list()
+        next_view = (view_del_ex_list,)
 
+    # ---- 进入等待输入状态 ----
+    elif action == "add_key":
+        _pending[user_id] = {"action": "add_key"}
+        next_view = (view_keys, True)
+    elif action == "add_ex":
+        _pending[user_id] = {"action": "add_ex"}
+        next_view = (view_ex, True)
+    elif action == "custom_interval":
+        _pending[user_id] = {"action": "set_interval"}
+        next_view = (view_interval, True)
+
+    # ---- 取消输入 ----
+    elif action == "cancel_input":
+        p = _pending.pop(user_id, None)
+        set_flash(chat_id, "⬜ 已取消")
+        if p:
+            if p["action"] == "add_key":
+                next_view = (view_keys, False)
+            elif p["action"] == "add_ex":
+                next_view = (view_ex, False)
+            elif p["action"] == "set_interval":
+                next_view = (view_interval, False)
+            else:
+                next_view = (view_main,)
+        else:
+            next_view = (view_main,)
+
+    # ---- 开关 ----
     elif action == "toggle_enabled":
         with _lock:
             config["enabled"] = not config["enabled"]
@@ -482,8 +639,9 @@ def handle_callback(cb):
                 config["chat_id"] = str(chat_id)
             save_config(config)
         toast = "已开启" if config["enabled"] else "已关闭"
-        new_view = view_main()
+        next_view = (view_main,)
 
+    # ---- 板块 ----
     elif action == "toggle_board":
         if arg in BOARDS:
             with _lock:
@@ -498,15 +656,16 @@ def handle_callback(cb):
                     subs.append(arg)
                     toast = f"✅ 已加入 {arg}"
                 save_config(config)
-        new_view = view_boards()
+        next_view = (view_boards,)
 
     elif action == "all_boards":
         with _lock:
             config["boards"] = []
             save_config(config)
         toast = "🌐 已切换全站模式"
-        new_view = view_boards()
+        next_view = (view_boards,)
 
+    # ---- 预设间隔 ----
     elif action == "set_interval":
         try:
             n = int(arg)
@@ -519,33 +678,9 @@ def handle_callback(cb):
                 toast = f"✅ 已设为 {n} 秒"
         except ValueError:
             toast = "参数错误"
-        new_view = view_interval()
+        next_view = (view_interval, False)
 
-    elif action == "custom_interval":
-        _pending[user_id] = {"action": "set_interval", "chat_id": chat_id, "menu_msg_id": msg_id}
-        tg_answer_cb(cb_id)
-        tg_send(chat_id,
-                "✏️ 请发送数字 (秒, 最小 10), 例: <code>60</code>\n发 /cancel 取消")
-        return
-
-    elif action == "add_key":
-        _pending[user_id] = {"action": "add_key", "chat_id": chat_id, "menu_msg_id": msg_id}
-        tg_answer_cb(cb_id)
-        tg_send(chat_id,
-                "➕ 请发送要添加的<b>关键词</b>\n"
-                "标题或内容包含它即会被推送\n"
-                "发 /cancel 取消")
-        return
-
-    elif action == "add_ex":
-        _pending[user_id] = {"action": "add_ex", "chat_id": chat_id, "menu_msg_id": msg_id}
-        tg_answer_cb(cb_id)
-        tg_send(chat_id,
-                "➕ 请发送要添加的<b>排除词</b>\n"
-                "命中它的帖子会被丢弃\n"
-                "发 /cancel 取消")
-        return
-
+    # ---- 删关键词/排除词 ----
     elif action == "del_key":
         with _lock:
             if arg in config["keywords"]:
@@ -554,7 +689,7 @@ def handle_callback(cb):
                 toast = f"已删除: {arg}"
             else:
                 toast = "已不存在"
-        new_view = view_del_key_list()
+        next_view = (view_del_key_list,)
 
     elif action == "del_ex":
         with _lock:
@@ -564,124 +699,151 @@ def handle_callback(cb):
                 toast = f"已删除: {arg}"
             else:
                 toast = "已不存在"
-        new_view = view_del_ex_list()
+        next_view = (view_del_ex_list,)
 
+    # ---- 清空确认 ----
     elif action == "clear_keys_confirm":
-        new_view = view_confirm("clear_keys", "清空所有关键词")
+        next_view = (view_confirm, "clear_keys", "清空所有关键词")
     elif action == "clear_ex_confirm":
-        new_view = view_confirm("clear_ex", "清空所有排除词")
-
+        next_view = (view_confirm, "clear_ex", "清空所有排除词")
     elif action == "confirm":
         if arg == "clear_keys":
             with _lock:
                 config["keywords"] = []
                 save_config(config)
             toast = "✅ 已清空关键词"
-            new_view = view_keys()
+            next_view = (view_keys, False)
         elif arg == "clear_ex":
             with _lock:
                 config["excludes"] = []
                 save_config(config)
             toast = "✅ 已清空排除词"
-            new_view = view_ex()
+            next_view = (view_ex, False)
 
     else:
         toast = "未知操作"
 
     tg_answer_cb(cb_id, toast)
-    if new_view:
-        text, markup = new_view
-        tg_edit(chat_id, msg_id, text, markup)
+    if next_view:
+        view_fn = next_view[0]
+        args = next_view[1:]
+        text, markup = view_fn(chat_id, *args)
+        resp = tg_edit(chat_id, msg_id, text, markup)
+        if resp and not resp.get("ok"):
+            _panel_msg.pop(chat_id, None)
+            send_new_panel(chat_id, user_id)
 
-# ========== 消息处理 (仅 /menu /start /cancel + pending 输入) ==========
+# ========== 消息处理 ==========
 def handle_message(msg):
     text = (msg.get("text") or "").strip()
     chat    = msg.get("chat", {})
     chat_id = chat.get("id")
     user_id = msg.get("from", {}).get("id")
+    user_msg_id = msg.get("message_id")
 
     if not is_allowed(user_id):
         log.warning("deny user %s: %s", user_id, text)
         tg_send(chat_id, "⛔ 你没有使用此机器人的权限")
         return
 
-    # 1. pending 输入 (用户在添加关键词/自定义间隔等场景下发送的文字)
+    # ---- pending 输入 ----
     if user_id in _pending and not text.startswith("/"):
-        p = _pending.pop(user_id)
+        p = _pending[user_id]
         action = p["action"]
-        menu_msg_id = p.get("menu_msg_id")
         value = text.strip()
 
-        toast_text = None
-        next_view = None
+        # 先删用户消息
+        tg_delete(chat_id, user_msg_id)
 
+        # 处理输入
+        ok = False
         if action == "add_key":
             with _lock:
-                if value in config["keywords"]:
-                    toast_text = f"已存在: {value}"
-                elif not value:
-                    toast_text = "内容为空"
+                if not value:
+                    set_flash(chat_id, "⚠️ 内容为空")
+                elif value in config["keywords"]:
+                    set_flash(chat_id, f"⚠️ 已存在: {html.escape(value)}")
                 else:
                     config["keywords"].append(value)
                     save_config(config)
-                    toast_text = f"✅ 已添加关键词: {value}"
-            next_view = view_keys()
+                    set_flash(chat_id, f"✅ 已添加关键词: {html.escape(value)}")
+                    ok = True
+            _pending.pop(user_id, None)
+            refresh_panel(chat_id, user_id, view_keys, False)
+            return
 
-        elif action == "add_ex":
+        if action == "add_ex":
             with _lock:
-                if value in config["excludes"]:
-                    toast_text = f"已存在: {value}"
-                elif not value:
-                    toast_text = "内容为空"
+                if not value:
+                    set_flash(chat_id, "⚠️ 内容为空")
+                elif value in config["excludes"]:
+                    set_flash(chat_id, f"⚠️ 已存在: {html.escape(value)}")
                 else:
                     config["excludes"].append(value)
                     save_config(config)
-                    toast_text = f"✅ 已添加排除词: {value}"
-            next_view = view_ex()
+                    set_flash(chat_id, f"✅ 已添加排除词: {html.escape(value)}")
+                    ok = True
+            _pending.pop(user_id, None)
+            refresh_panel(chat_id, user_id, view_ex, False)
+            return
 
-        elif action == "set_interval":
+        if action == "set_interval":
             try:
                 n = int(value)
                 if n < 10:
-                    toast_text = "⚠️ 不能小于 10 秒"
+                    set_flash(chat_id, "⚠️ 不能小于 10 秒")
                 else:
                     with _lock:
                         config["interval"] = n
                         save_config(config)
-                    toast_text = f"✅ 已设为 {n} 秒"
+                    set_flash(chat_id, f"✅ 间隔已设为 {n} 秒")
+                    ok = True
             except ValueError:
-                toast_text = "请发送数字"
-            next_view = view_interval()
+                set_flash(chat_id, "⚠️ 请发送数字")
+            _pending.pop(user_id, None)
+            refresh_panel(chat_id, user_id, view_interval, False)
+            return
 
-        tg_send(chat_id, toast_text or "已完成")
-        if menu_msg_id and next_view:
-            tg_edit(chat_id, menu_msg_id, next_view[0], next_view[1])
+    # ---- 命令 ----
+    if text.startswith("/"):
+        cmd = text.split()[0].split("@")[0].lower()
+
+        if cmd == "/cancel":
+            # 删用户消息
+            tg_delete(chat_id, user_msg_id)
+            if user_id in _pending:
+                p = _pending.pop(user_id)
+                set_flash(chat_id, "⬜ 已取消")
+                action = p["action"]
+                if action == "add_key":
+                    refresh_panel(chat_id, user_id, view_keys, False)
+                elif action == "add_ex":
+                    refresh_panel(chat_id, user_id, view_ex, False)
+                elif action == "set_interval":
+                    refresh_panel(chat_id, user_id, view_interval, False)
+                else:
+                    refresh_panel(chat_id, user_id, view_main)
+            # 不在 pending 状态, 不作任何回复
+            return
+
+        if cmd in ("/menu", "/start"):
+            # 删用户消息
+            tg_delete(chat_id, user_msg_id)
+            # 删旧面板
+            old = _panel_msg.pop(chat_id, None)
+            if old:
+                tg_delete(chat_id, old)
+            # 清除 pending
+            _pending.pop(user_id, None)
+            # 发新面板到底部
+            send_new_panel(chat_id, user_id)
+            return
+
+        # 废弃命令 / 未知命令: 不回复, 不删 (用户自己清理)
         return
 
-    # 2. 非命令消息直接忽略 (或提示)
-    if not text.startswith("/"):
-        # 用户随便打字发过来, 提示用面板
-        tg_send(chat_id, "👉 请点输入框左边的菜单按钮, 或发送 /menu 打开控制面板")
-        return
-
-    # 3. 命令
-    cmd = text.split()[0].split("@")[0].lower()
-
-    if cmd == "/cancel":
-        if user_id in _pending:
-            _pending.pop(user_id)
-            tg_send(chat_id, "已取消")
-        else:
-            tg_send(chat_id, "当前没有待输入操作")
-        return
-
-    if cmd in ("/menu", "/start"):
-        t, markup = view_main()
-        tg_send(chat_id, t, reply_markup=markup)
-        return
-
-    # 其他命令一律提示用面板
-    tg_send(chat_id, "该命令已废弃, 请点输入框左边的菜单按钮, 或发送 /menu 打开控制面板")
+    # ---- 非命令、非 pending 的乱打字: 不回复, 不删 ----
+    return
 
 # ========== TG long polling ==========
 def tg_updates_loop():
@@ -717,7 +879,7 @@ def tg_updates_loop():
             log.warning("getUpdates error: %s", e)
             time.sleep(5)
 
-# ========== RSS 轮询循环 ==========
+# ========== RSS loop ==========
 def poll_loop():
     if not seen:
         try:
@@ -756,7 +918,6 @@ def main():
     log.info("NsAlert start, boards=%s, interval=%ds, keys=%s, excludes=%s",
              board_info, config["interval"], config["keywords"], config["excludes"])
 
-    # 注册 TG 菜单按钮 + 命令列表
     try:
         setup_tg_ui()
     except Exception as e:
