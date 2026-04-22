@@ -1,0 +1,21 @@
+services:
+  nodeseek-monitor:
+    build: .
+    container_name: nodeseek-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CATEGORY: "交易"
+    volumes:
+      - ./data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.3"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
