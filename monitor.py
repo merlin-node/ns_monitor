@@ -21,7 +21,7 @@ import requests
 
 # ========== 启动配置 (仅首次启动用, 之后以 config.json 为准) ==========
 RSS_URL       = os.getenv("RSS_URL", "https://rss.nodeseek.com/")
-CATEGORY      = os.getenv("CATEGORY", "交易")
+CATEGORY      = os.getenv("CATEGORY", "trade")
 TG_TOKEN      = os.getenv("TG_BOT_TOKEN", "").strip()
 PROXY         = os.getenv("HTTPS_PROXY", "").strip()
 DATA_DIR      = Path(os.getenv("DATA_DIR", "/data"))
