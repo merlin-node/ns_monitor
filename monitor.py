@@ -258,8 +258,7 @@ def poll_once():
 
         msg = (
             f"🔔 <b>NodeSeek · {html.escape(board_zh)}</b>\n\n"
-            f"<b>{html.escape(title)}</b>\n"
-            f"👤 {html.escape(author)}\n\n"
+            f"<b>{html.escape(title)}</b>\n\n"
             f"{html.escape(snippet)}\n\n"
             f"🔗 <a href=\"{html.escape(link)}\">查看原帖</a>"
         )
